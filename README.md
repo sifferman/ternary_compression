@@ -17,5 +17,11 @@ $$
 However, decompressing is non-trivial, and there are ${256 \choose 13} \approx 2.4 \times 10^{21}$ possible LUTs. Some LUTs use fewer resources than others, so this repo attempts to find an optimal one.
 
 ```bash
-python3 ./mc.py --jobs `nproc` --runs 100 --iterations 40
+python3 ./mc.py --jobs `nproc` \
+                --runs 10000 \
+                --low-heat 0.06 \
+                --low-heat-iterations 50 \
+                --high-heat 0.4 \
+                --high-heat-iterations 2 \
+                --num-heat-cycles 2
 ```

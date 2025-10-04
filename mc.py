@@ -12,7 +12,7 @@ import subprocess
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# build LUT_VALUES: 0..1023 but skip any that have digit '2' in base-4 (length 243)
+# build LUT_VALUES: numbers 0..1023 but skip any that have digit '2' in base-4 (length 243)
 LUT_VALUES = []
 for n in range(0, 1024):
     x = n
@@ -51,10 +51,9 @@ def _stat_path_for_holes(holes):
 
 def get_utilization(holes):
     """
-    Try to read memh_files/<basename>.stat.json and return design.num_cells from
-    modules -> "\lut" -> num_cells. If not present, write the .memh (with 'xxx'
-    in hole slots), run yosys (commands via -p), then read the stat json.
-    Returns int or None on failure.
+    Read memh_files/<basename>.stat.json modules->"\lut"->num_cells if present.
+    Otherwise write memh_files/<basename>.memh (with 'xxx' in hole slots), run yosys,
+    and then read the stat file. Returns int or None.
     """
     if not holes or len(holes) != 13:
         raise ValueError("holes must be a list of 13 integers")
@@ -128,7 +127,7 @@ def get_utilization(holes):
 def change_hole(holes, index):
     """
     Return a new holes list copy where only holes[index] is changed.
-    Move it to a new random location strictly between neighbors (left+1 .. right-1).
+    Move it to a new random location strictly between neighbors.
     For edges, left is -1 and right is 256.
     Ensure a change when possible.
     """
@@ -165,18 +164,133 @@ def _log_new_global_best(holes, score):
         os.fsync(fh.fileno())
 
 
-def monte_carlo(holes=None, heat=0.1, iterations=10):
-    """
-    Monte Carlo with local-best/patience stopping:
-    - holes: initial holes or randomize if None
-    - heat: acceptance probability for worse proposals
-    - iterations: patience threshold (number of non-improving evaluations before quit)
+def _maybe_update_global_best(candidate, cand_score):
+    """Update global best (and log) if candidate improves it. Must be called under lock."""
+    global best_holes, global_best_score
+    if global_best_score is None or cand_score < global_best_score:
+        best_holes = candidate.copy()
+        global_best_score = cand_score
+        _log_new_global_best(best_holes, global_best_score)
+        print(f"New global best: score={global_best_score} holes={best_holes}", flush=True)
 
-    The function:
-      - tracks local_best_score and local_best_holes
-      - resets the no-improve counter to 0 whenever a candidate meets or beats local_best_score
-      - quits only if it hasn't found a new local_best_score in `iterations` evaluations
-      - prints its local best on exit and returns it
+
+def _run_until_frozen(holes, current_score, local_best_score, local_best_holes, heat, patience):
+    """
+    Run proposals until no_improve reaches patience. Progress is measured per full pass:
+    - For each pass: attempt to change every hole in order.
+    - During the pass, updates to local_best_score/local_best_holes/current_score/holes happen as usual.
+    - After the full pass, if local_best_score improved compared to before the pass,
+      reset no_improve = 0; otherwise increment no_improve by 1.
+    Prints current score & holes after every pass.
+    Returns updated (holes, current_score, local_best_score, local_best_holes).
+    """
+    no_improve = 0
+    pass_no = 0
+    while no_improve < patience:
+        prev_local_best = local_best_score
+        pass_no += 1
+
+        # do one full pass: test every hole
+        for idx in range(len(holes)):
+            candidate = change_hole(holes, idx)
+            cand_score = get_utilization(candidate)
+            if cand_score is None:
+                cand_score = 10 ** 12
+
+            # If candidate is a new local best or equal, always take it
+            if cand_score <= local_best_score:
+                local_best_score = cand_score
+                local_best_holes = candidate.copy()
+                holes = candidate
+                current_score = cand_score
+                # possibly update global best (under lock)
+                with best_holes_lock:
+                    _maybe_update_global_best(candidate, cand_score)
+                continue
+
+            # acceptance rules relative to current_score:
+            if cand_score < current_score:
+                # ALWAYS accept better (ignore heat)
+                holes = candidate
+                current_score = cand_score
+            elif cand_score > current_score:
+                # worse: accept with probability heat
+                if random.random() < heat:
+                    holes = candidate
+                    current_score = cand_score
+            # equal to current_score: do nothing
+
+        # end of full pass: decide whether to reset no_improve
+        if local_best_score < prev_local_best:
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # debug: print status after each full pass
+        # print(
+        #     f"[low-run] pass={pass_no} heat={heat} current_score={current_score} holes={holes} local_best_score={local_best_score}",
+        #     flush=True,
+        # )
+
+    return holes, current_score, local_best_score, local_best_holes
+
+
+def _run_fixed_iterations(holes, current_score, local_best_score, local_best_holes, heat, iterations):
+    """
+    Run a fixed number of passes (iterations) over all hole indices using `heat`.
+    - For each pass: loop over indices and propose.
+    - Update local best if found (and keep it).
+    Prints current score & holes after every pass.
+    Returns updated (holes, current_score, local_best_score, local_best_holes).
+    """
+    for pass_no in range(1, iterations + 1):
+        for idx in range(len(holes)):
+            candidate = change_hole(holes, idx)
+            cand_score = get_utilization(candidate)
+            if cand_score is None:
+                cand_score = 10 ** 12
+
+            # If candidate <= local_best_score, always take and update local best
+            if cand_score <= local_best_score:
+                local_best_score = cand_score
+                local_best_holes = candidate.copy()
+                holes = candidate
+                current_score = cand_score
+                with best_holes_lock:
+                    _maybe_update_global_best(candidate, cand_score)
+                continue
+
+            if cand_score < current_score:
+                # always accept better
+                holes = candidate
+                current_score = cand_score
+            elif cand_score > current_score:
+                # accept worse with probability heat
+                if random.random() < heat:
+                    holes = candidate
+                    current_score = cand_score
+            # equal -> do nothing
+
+        # debug: print status after each full pass
+        # print(
+        #     f"[high-run] pass={pass_no}/{iterations} heat={heat} current_score={current_score} holes={holes} local_best_score={local_best_score}",
+        #     flush=True,
+        # )
+    return holes, current_score, local_best_score, local_best_holes
+
+
+def monte_carlo(
+    holes=None,
+    low_heat=0.1,
+    low_heat_iterations=10,
+    high_heat=0.5,
+    high_heat_iterations=10,
+    num_heat_cycles=1,
+):
+    """
+    Monte Carlo with alternating low/high heat cycles.
+
+    Returns {"holes": local_best_holes, "score": local_best_score} and prints local best on exit.
     """
     global best_holes, global_best_score
 
@@ -193,58 +307,52 @@ def monte_carlo(holes=None, heat=0.1, iterations=10):
     local_best_score = current_score
     local_best_holes = holes.copy()
 
-    no_improve = 0  # counts how many evaluations since last local best
-    # continue until no_improve reaches iterations
-    while no_improve < iterations:
-        for idx in range(len(holes)):
-            if no_improve >= iterations:
-                break
+    # print(f"Starting monte_carlo: initial_score={current_score} holes={holes}", flush=True)
 
-            candidate = change_hole(holes, idx)
-            cand_score = get_utilization(candidate)
-            if cand_score is None:
-                cand_score = 10 ** 12
+    # print(f"Entering low-heat phase: heat={low_heat}, patience={low_heat_iterations}", flush=True)
+    holes, current_score, local_best_score, local_best_holes = _run_until_frozen(
+        holes, current_score, local_best_score, local_best_holes, low_heat, low_heat_iterations
+    )
 
-            # If candidate meets or beats the local best, always take it and reset counter
-            if cand_score <= local_best_score:
-                local_best_score = cand_score
-                local_best_holes = candidate.copy()
-                holes = candidate
-                current_score = cand_score
-                no_improve = 0
+    for cycle in range(1, num_heat_cycles + 1):
+        # print(f"Cycle {cycle}/{num_heat_cycles}: switching to high heat={high_heat} for {high_heat_iterations} passes", flush=True)
+        # high heat: fixed iterations
+        holes, current_score, local_best_score, local_best_holes = _run_fixed_iterations(
+            holes, current_score, local_best_score, local_best_holes, high_heat, high_heat_iterations
+        )
 
-                # update global best if surpassed (under lock) — this is the only place we read global_best_score
-                with best_holes_lock:
-                    if global_best_score is None or cand_score < global_best_score:
-                        best_holes = candidate.copy()
-                        global_best_score = cand_score
-                        _log_new_global_best(best_holes, global_best_score)
-                        print(f"New global best: score={global_best_score} holes={best_holes}", flush=True)
-                continue
+        # print(f"Cycle {cycle}/{num_heat_cycles}: switching back to low heat={low_heat} until frozen", flush=True)
+        # low heat until frozen
+        holes, current_score, local_best_score, local_best_holes = _run_until_frozen(
+            holes, current_score, local_best_score, local_best_holes, low_heat, low_heat_iterations
+        )
 
-            # otherwise, acceptance based on comparison with current_score
-            if cand_score < current_score:
-                # better than current: accept with prob (1 - heat)
-                if random.random() < (1.0 - heat):
-                    holes = candidate
-                    current_score = cand_score
-            elif cand_score > current_score:
-                # worse than current: accept with prob heat
-                if random.random() < heat:
-                    holes = candidate
-                    current_score = cand_score
-            # if equal to current_score but not <= local_best_score, do nothing
-
-            no_improve += 1
-
-    # finished: print and return local best
     print(f"Finished monte_carlo: local_best_score={local_best_score} local_best_holes={local_best_holes}", flush=True)
     return {"holes": local_best_holes, "score": local_best_score}
 
 
-def main(jobs=4, runs=8, heat=0.1, iterations=10):
+def main(
+    jobs=4,
+    runs=8,
+    low_heat=0.1,
+    low_heat_iterations=10,
+    high_heat=0.5,
+    high_heat_iterations=10,
+    num_heat_cycles=1,
+):
     with ThreadPoolExecutor(max_workers=jobs) as ex:
-        futures = [ex.submit(monte_carlo, None, heat, iterations) for _ in range(runs)]
+        futures = [
+            ex.submit(
+                monte_carlo,
+                None,
+                low_heat,
+                low_heat_iterations,
+                high_heat,
+                high_heat_iterations,
+                num_heat_cycles,
+            )
+            for _ in range(runs)
+        ]
         for f in as_completed(futures):
             try:
                 res = f.result()
@@ -253,13 +361,39 @@ def main(jobs=4, runs=8, heat=0.1, iterations=10):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Monte Carlo hole optimizer")
+    parser = argparse.ArgumentParser(description="Monte Carlo hole optimizer with heat cycles")
     parser.add_argument("--jobs", type=int, default=4, help="number of concurrent threads")
     parser.add_argument("--runs", type=int, default=8, help="total monte carlo runs to execute")
-    parser.add_argument("--heat", type=float, default=0.1, help="heat parameter (0..1)")
-    parser.add_argument("--iterations", type=int, default=10, help="patience: number of non-improving evaluations before quitting")
+    parser.add_argument("--low-heat", type=float, default=0.1, help="low heat (accept worse with this probability)")
+    parser.add_argument(
+        "--low-heat-iterations",
+        type=int,
+        default=10,
+        help="patience for low heat: number of non-improving full passes before quitting low-heat phase",
+    )
+    parser.add_argument("--high-heat", type=float, default=0.5, help="high heat (accept worse with this probability)")
+    parser.add_argument(
+        "--high-heat-iterations",
+        type=int,
+        default=10,
+        help="number of full-index passes to run during high-heat phase",
+    )
+    parser.add_argument(
+        "--num-heat-cycles",
+        type=int,
+        default=1,
+        help="number of high-heat -> low-heat cycles to perform after the initial low-heat freeze",
+    )
     parser.add_argument("--best-file", type=str, default="best_holes.txt", help="file to store best holes")
     args = parser.parse_args()
 
     best_holes_filename = args.best_file
-    main(jobs=args.jobs, runs=args.runs, heat=args.heat, iterations=args.iterations)
+    main(
+        jobs=args.jobs,
+        runs=args.runs,
+        low_heat=args.low_heat,
+        low_heat_iterations=args.low_heat_iterations,
+        high_heat=args.high_heat,
+        high_heat_iterations=args.high_heat_iterations,
+        num_heat_cycles=args.num_heat_cycles,
+    )
